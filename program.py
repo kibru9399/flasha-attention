@@ -3,6 +3,69 @@ import triton
 import triton.language as tl
 
 @triton.jit
+def _attn_fwd_inner(
+            O_block,
+            l_i,
+            m_i,
+            Q_block,
+            K_block_ptr,
+            V_block_ptr,
+            block_index_q,
+            softmax_scale,
+            BLOCK_SIZE_Q: tl.constexpr,
+            BLOCK_SIZE_KV: tl.constexpr,
+            STAGE: tl.constexpr,
+            offs_q: tl.constexpr,
+            offs_kv: tl.constexpr,
+            SEQ_LEN: tl.constexpr,
+):
+    #range of values handled by this stage
+    if STAGE == 1:
+        # from 0 to the left of the diagonal
+        #lo, high tell us what is lower and higher index of the key block that this particular stage 
+        #should be working with
+        lo, hi = 0, block_index_q*BLOCK_SIZE_Q
+    elif STAGE == 2:
+        #used for the block in which there is a transition between masked and non-masked keys
+        lo, hi = block_index_q*BLOCK_SIZE_Q, (block_index_q + 1)*BLOCK_SIZE_Q
+        lo = tl.multiple_of(lo, BLOCK_SIZE_Q)
+    else:
+        lo, hi = 0, SEQ_LEN
+    K_block_ptr = tl.advance(K_block_ptr, (0, lo))
+    V_block_ptr = tl.advance(V_block_ptr,(lo, 0))
+    for start_kv in range(lo, hi, BLOCK_SIZE_KV):
+        start_kv = tl.multiple_of(start_kv, BLOCK_SIZE_KV)
+
+        K_block = tl.load(K_block_ptr)
+        QK_block = tl.dot(Q_block, K_block)
+        if STAGE == 2:
+            mask = offs_q[:, None] >= (start_kv + offs_kv[None, :])
+            QK_block = QK_block*softmax_scale + tl.where(mask, 0, 1e-6)
+            m_ij = tl.maximum(m_i, tl.max(QK_block, 1))
+            QK_block -= m_ij[:, None]
+        else:
+            m_ij = tl.maximum(m_i, tl.max(QK_block, 1)*softmax_scale)
+            QK_block = QK_block*softmax_scale - m_ij[:, None]
+
+        P_block = tl.math.exp(QK_block)
+        l_ij = tl.sum(P_block, 1)
+        alpha = tl.math.exp(m_i - m_ij)
+        l_i = l_i*alpha + l_ij
+        V_block = tl.load(V_block_ptr)
+        P_block = P_block.to(tl.float16)
+        O_block = O_block*alpha[:, None]
+        O_block = tl.dot(P_block, V_block, O_block)
+
+        m_i = m_ij
+
+        V_block_ptr = tl.advance(V_block_ptr, (BLOCK_SIZE_KV, 0)) #seq_len, head_dim
+        K_block_ptr = tl.advance(V_block_ptr, (0, BLOCK_SIZE_KV)) #K[HEAD_DIM, SEQ_LEN]
+
+    return O_block, l_i, m_i
+
+
+
+@triton.jit
 def _attn_fwd(
     Q,
     K, 
@@ -28,7 +91,8 @@ def _attn_fwd(
     stride_O_dim,
     BATCH_SIZE, 
     NUM_HEADS: tl.constexpr,
-    SEQ_LEN: tl.constexpr, 
+    SEQ_LEN: tl.constexpr,
+    HEAD_DIM: tl.constexpr, 
     BLOCK_SIZE_Q: tl.constexpr,
     BLOCK_SIZE_KV: tl.constexpr, 
     STAGE: tl.constexpr
@@ -42,8 +106,94 @@ def _attn_fwd(
 
     qvk_offset = (
         index_batch.to(tl.int64)*stride_Q_batch
-        + index_batch_head.to(tlint64)*stride_Q_head
+        + index_batch_head.to(tl.int64)*stride_Q_head
     )
+    Q_block_ptr = tl.make_block_ptr(
+        base=Q + qvk_offset, #Q[index_batch, index_head, block_index_q*BLOCK_SIZE_Q:, :]
+        shape=(SEQ_LEN, HEAD_DIM),
+        strides=(stride_Q_seq, stride_Q_dim),
+        offset=(block_index_q*BLOCK_SIZE_Q, 0), 
+        block_shape=(BLOCK_SIZE_Q, HEAD_DIM),
+        order=(1, 0),
+    )
+
+    V_block_ptr = tl.make_block_ptr(
+        base=V + qvk_offset, #Q[index_batch, index_head, :, :]
+        shape=(SEQ_LEN, HEAD_DIM),
+        strides=(stride_V_seq, stride_V_dim),
+        offset=(0, 0), 
+        block_shape=(BLOCK_SIZE_KV, HEAD_DIM),
+        order=(1, 0),
+    )
+    K_block_ptr = tl.make_block_ptr(
+        base=K + qvk_offset, #k[index_batch, index_head, :, :]
+        shape=(HEAD_DIM, SEQ_LEN),
+        strides=(stride_K_dim, stride_K_seq),
+        offset=(0, 0), 
+        block_shape=(HEAD_DIM, BLOCK_SIZE_KV),
+        order=(1, 0),
+    )
+    O_block_ptr = tl.make_block_ptr(
+        base=O + qvk_offset, #Q[index_batch, index_head, block_index_q*BLOCK_SIZE_Q:, :]
+        shape=(SEQ_LEN, HEAD_DIM),
+        strides=(stride_O_seq, stride_O_dim),
+        offset=(block_index_q*BLOCK_SIZE_Q, 0), 
+        block_shape=(BLOCK_SIZE_Q, HEAD_DIM),
+        order=(1, 0),
+    )
+    #the offset for the tokens in Q to process
+    offs_q = block_index_q*BLOCK_SIZE_Q + tl.range(0, BLOCK_SIZE_Q)
+
+    #the offsets for  the tokens in the K AND V to process
+    offs_kv = tl.range(0, BLOCK_SIZE_KV)
+    #m_i: the running maximum, we have on for each query
+    m_i = tl.zeros([BLOCK_SIZE_Q], dtype=tl.float32) - float('inf')
+    #l_i: the running sum we have one for each query
+    l_i = tl.zeros([BLOCK_SIZE_Q], dtype=tl.float32) + 1.0
+    #the accumulator for the output, group of rows of the O matrix
+    O_block = tl.zeros([BLOCK_SIZE_Q, HEAD_DIM], dtype=tl.float32)
+    #load the blocks of Q: it will stay in the SRAM throughout
+    Q_block = tl.load(Q_block_ptr)
+
+    # Stage: 3 if causal, else 1
+
+    if STAGE == 1 or STAGE == 3:
+        # This step runs for non-causal attention or for the blocks to the left of the diagonal in the causal attention
+        O_block, l_i, m_i = _attn_fwd_inner(
+            O_block,
+            l_i,
+            m_i,
+            Q_block,
+            K_block_ptr,
+            V_block_ptr,
+            block_index_q,
+            softmax_scale,
+            BLOCK_SIZE_Q,
+            BLOCK_SIZE_KV,
+            4 - STAGE,
+            offs_q,
+            offs_kv,
+            SEQ_LEN,
+        )
+
+    if STAGE == 3:
+        # This step runs for the blocks to the right of the diagonal in the causal attention
+        O_block, l_i, m_i = _attn_fwd_inner(
+            O_block,
+            l_i,
+            m_i,
+            Q_block,
+            K_block_ptr,
+            V_block_ptr,
+            block_index_q,
+            softmax_scale,
+            BLOCK_SIZE_Q,
+            BLOCK_SIZE_KV,
+            2,
+            offs_q,
+            offs_kv,
+            SEQ_LEN,
+        )
 
 
 class TritonAttention(torch.autugrad.Function):
